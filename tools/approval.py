@@ -517,6 +517,22 @@ DANGEROUS_PATTERNS = [
     # into a single -X token. Catches the same threat class.
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
+    # (B) Direct secret/credential reads. Three-tier model: these are
+    # owner-only sensitive actions, gated for TRUST callers via the same
+    # check_dangerous_command path as (A). This is a guardrail, NOT a
+    # boundary — `python -c`, `xxd`, `env | grep`, etc. bypass it (see
+    # SECURITY.md §2.4). The patterns only catch the obvious plaintext-dump
+    # tools. Anchored to the read commands so they don't fire on unrelated
+    # uses of the words. Bare local ``.env`` reads are intentionally NOT
+    # matched here — the project treats reading a workspace ``.env`` as safe
+    # (see TestSensitiveRedirectPattern); the Hermes credential ``.env`` is
+    # covered by the dedicated _HERMES_ENV_PATH pattern below.
+    (r'\b(?:cat|less|more|head|tail|bat|nl|xxd|od|strings)\b[^\n]*\.(?:pem|key|crt|p12|pfx)\b',
+     "read secret/credential file (pem/key/crt/p12/pfx)"),
+    (rf'\b(?:cat|less|more|head|tail|bat|nl|xxd|od|strings)\b[^\n]*(?:{_SSH_SENSITIVE_PATH}|{_CREDENTIAL_FILES})',
+     "read SSH/credential file (~/.ssh, ~/.netrc, ~/.pgpass, etc.)"),
+    (rf'\b(?:cat|less|more|head|tail|bat|nl|xxd|od|strings)\b[^\n]*(?:{_HERMES_ENV_PATH})',
+     "read Hermes .env secrets"),
 ]
 
 
@@ -1095,6 +1111,47 @@ Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
         return "escalate"
 
 
+def _trust_tier_block(pattern_key, description: str) -> Optional[dict]:
+    """Return a TRUST-caller block result for a dangerous command, or None.
+
+    Three-tier gate (A)+(B): a TRUST caller may not run dangerous shell
+    commands or secret-reading patterns — these are owner-only sensitive
+    actions, refused immediately with no owner-approval wait (BR-2). OWNER
+    and NO_TRUST callers (and any non-gateway context) get ``None`` and fall
+    through to the normal approval flow.
+
+    Shared by ``check_dangerous_command`` and ``check_all_command_guards``
+    (the path terminal_tool actually uses) so both terminal entry points gate
+    TRUST identically. Callers MUST invoke this AFTER the hardline floor but
+    BEFORE the yolo/mode=off bypass, so a TRUST caller cannot escalate via
+    ``/yolo`` (BR-2). The user-facing message is intentionally generic; the
+    matched ``description`` is logged but not surfaced.
+    """
+    try:
+        from gateway.trust import TrustTier, get_current_trust_tier
+    except ImportError:
+        # gateway.trust unavailable (CLI-only / minimal import context) —
+        # tier gating does not apply outside the gateway. Fall through.
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Trust-tier gate import failed; not gating: %s", exc)
+        return None
+    if get_current_trust_tier() == TrustTier.TRUST:
+        logger.info(
+            "Blocked dangerous command for TRUST caller (%s)", description,
+        )
+        return {
+            "approved": False,
+            "pattern_key": pattern_key,
+            "description": description,
+            "message": (
+                "⛔ This action is restricted to the owner. "
+                "Ask the bot owner to run it."
+            ),
+        }
+    return None
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None) -> dict:
     """Check if a command is dangerous and handle approval.
@@ -1123,12 +1180,23 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+
+    # Three-tier gate (A)+(B): block a TRUST caller's dangerous command
+    # immediately. Placed AFTER the hardline floor (hardline blocks everyone,
+    # owner included) but BEFORE the yolo bypass below so a TRUST caller
+    # cannot escalate via /yolo (BR-2). OWNER/NO_TRUST get None and fall
+    # through to the unchanged approval flow.
+    if is_dangerous:
+        _trust_block = _trust_tier_block(pattern_key, description)
+        if _trust_block is not None:
+            return _trust_block
+
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
         return {"approved": True, "message": None}
 
@@ -1364,6 +1432,18 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
+    # Three-tier gate (A)+(B): block a TRUST caller's dangerous command on the
+    # consolidated path (this is what terminal_tool actually calls). Placed
+    # AFTER the unconditional hardline/sudo floors but BEFORE the yolo /
+    # mode=off bypass so a TRUST caller cannot escalate via /yolo (BR-2).
+    # Detection here is reused below (Phase 1) — detect_dangerous_command is a
+    # pure regex match, so computing it once up front is behavior-neutral.
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if is_dangerous:
+        _trust_block = _trust_tier_block(pattern_key, description)
+        if _trust_block is not None:
+            return _trust_block
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
@@ -1406,8 +1486,9 @@ def check_all_command_guards(command: str, env_type: str,
     except ImportError:
         pass  # tirith module not installed — allow
 
-    # Dangerous command check (detection only, no approval)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    # Dangerous command detection already computed above (before the yolo
+    # bypass, for the TRUST gate); reuse is_dangerous / pattern_key /
+    # description here.
 
     # --- Phase 2: Decide ---
 

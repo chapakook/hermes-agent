@@ -18,7 +18,7 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -26,6 +26,9 @@ from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
+
+if TYPE_CHECKING:
+    from gateway.trust import TrustTier
 
 
 class GatewayAuthorizationMixin:
@@ -173,10 +176,86 @@ class GatewayAuthorizationMixin:
             return any(str(item).strip() for item in sender_allow)
         return False
 
+    def _owner_user_ids_for_source(self, source: SessionSource) -> set:
+        """Return the configured owner user IDs for *source*'s scope.
+
+        Reads the ``owner_from`` (DM scope) / ``group_owner_from`` (group/
+        channel/forum scope) key from the platform's ``config.extra``. This
+        key is the OWNER tier identifier — distinct from ``allow_admin_from``
+        (slash-command admin) so the two concepts can coexist (BR-3). There is
+        NO env-var bridge: owner identity is config-only.
+
+        Returns an empty set when no owner is configured for the scope, in
+        which case the platform has no OWNER (transparent TRUST fallback,
+        BR-5) — sensitive actions are then blocked for everyone but internal
+        events.
+        """
+        config = getattr(self, "config", None)
+        if config is None or not hasattr(config, "platforms"):
+            return set()
+        platform_cfg = config.platforms.get(source.platform) if source.platform else None
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+        if not isinstance(extra, dict):
+            return set()
+        scope_key = (
+            "group_owner_from"
+            if source.chat_type in {"group", "forum", "channel"}
+            else "owner_from"
+        )
+        raw = extra.get(scope_key)
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            items = raw
+        elif isinstance(raw, str):
+            items = (s for s in raw.split(",") if s.strip())
+        else:
+            # Single scalar (e.g. a YAML integer user_id) — stringify it.
+            items = (raw,)
+        # Drop None / empty entries; stringify the rest (so a YAML integer
+        # user_id 12345 matches the string "12345" that SessionSource carries).
+        # Mirrors gateway.slash_access._coerce_id_list so owner_from and
+        # allow_admin_from normalize identifiers identically.
+        owner_ids: set = set()
+        for it in items:
+            if it is None:
+                continue
+            sid = str(it).strip()
+            if sid:
+                owner_ids.add(sid)
+        return owner_ids
+
+    def _resolve_trust_tier(self, source: SessionSource) -> "TrustTier":
+        """Resolve *source* into one of OWNER / TRUST / NO_TRUST (FR-1).
+
+        Computed once at message intake; the result is bound to a contextvar
+        (see gateway/run.py) so per-tool-call gates can read it without
+        recomputing (BR-1).
+
+        Logic:
+        1. Home Assistant / webhook events are system-authenticated and always
+           OWNER (mirrors the unconditional ``True`` in ``_is_user_authorized``).
+        2. Otherwise run the existing access gate. If it fails → NO_TRUST.
+        3. If it passes and ``source.user_id`` is in the configured owner set
+           → OWNER (owner requires a user_id). Otherwise → TRUST.
+        """
+        from gateway.trust import TrustTier
+
+        if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
+            return TrustTier.OWNER
+
+        if not self._is_user_authorized(source):
+            return TrustTier.NO_TRUST
+
+        user_id = source.user_id
+        if user_id and user_id in self._owner_user_ids_for_source(source):
+            return TrustTier.OWNER
+        return TrustTier.TRUST
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
-        
+
         Checks in order:
         1. Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
