@@ -380,6 +380,80 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+def _is_hermes_config_path(filepath: str, task_id: str = "default") -> bool:
+    """Whether *filepath* resolves to the Hermes config file (config.yaml).
+
+    Used by the three-tier write gate to carve out the self-disablement
+    target: OWNER may write other sensitive paths but never config.yaml
+    (where approvals.mode / yolo live — a write would let the agent disable
+    its own approval gate mid-session).
+    """
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError):
+        resolved = filepath
+    # Resolve symlinks on the fallback comparison path too, so a symlink that
+    # points at config.yaml can't slip past the carve-out (e.g.
+    # /tmp/link -> ~/.hermes/config.yaml). _get_hermes_config_resolved()
+    # itself is a realpath, so both sides must be realpath'd to match.
+    try:
+        normalized = os.path.realpath(os.path.expanduser(filepath))
+    except OSError:
+        normalized = os.path.normpath(os.path.expanduser(filepath))
+    hermes_config = _get_hermes_config_resolved()
+    if not hermes_config:
+        # Can't determine the config path → fail closed. The carve-out exists
+        # to prevent the agent from disabling its own approval gate; if we're
+        # unsure, treat the target as config.yaml (blocked) rather than
+        # allowing a potential self-disablement write through.
+        return True
+    return resolved == hermes_config or normalized == hermes_config
+
+
+def _check_sensitive_path_for_tier(filepath: str, task_id: str = "default") -> str | None:
+    """Tier-aware wrapper around ``_check_sensitive_path`` (FR-7 (C)).
+
+    Three-tier model for sensitive file WRITES:
+      - TRUST  → full sensitive-path block (delegate to _check_sensitive_path).
+        Sensitive writes are an owner-only action; TRUST is refused entirely.
+      - OWNER  → carve-out: block config.yaml ONLY (self-disablement guard),
+        allow every other sensitive path through. The owner is trusted to
+        edit /etc, ~/.ssh, etc. via the file tools.
+      - NO_TRUST → fail closed: keep the full block (NO_TRUST never reaches
+        the agent normally, but if it somehow does, deny like before).
+
+    Outside the gateway (CLI / minimal import), gateway.trust is unavailable
+    and the default tier is NO_TRUST → unchanged full block, preserving the
+    existing CLI behavior.
+
+    ``_check_sensitive_path`` itself is unchanged; this only decides whether
+    to consult it and how to interpret its result for OWNER.
+    """
+    try:
+        from gateway.trust import TrustTier, get_current_trust_tier
+        tier = get_current_trust_tier()
+    except Exception:
+        tier = None
+
+    if tier is not None and tier == TrustTier.OWNER:
+        # Owner carve-out: only config.yaml stays blocked. Decide this from
+        # _is_hermes_config_path ALONE (it is fail-closed when the config path
+        # can't be resolved). Do NOT delegate to _check_sensitive_path here:
+        # when _get_hermes_config_resolved() is None that function fails OPEN
+        # for config.yaml (no prefix match), which would silently defeat the
+        # self-disablement carve-out. Return the block message directly.
+        if _is_hermes_config_path(filepath, task_id):
+            return (
+                f"Refusing to write to Hermes config file: {filepath}\n"
+                "Agent cannot modify security-sensitive configuration. "
+                "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+            )
+        return None
+
+    # TRUST / NO_TRUST / non-gateway: full sensitive-path block.
+    return _check_sensitive_path(filepath, task_id)
+
+
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
     """Return the container-side Hermes mirror prefix for Docker file tools."""
     try:
@@ -1188,7 +1262,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
-    sensitive_err = _check_sensitive_path(path, task_id)
+    sensitive_err = _check_sensitive_path_for_tier(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
     if not cross_profile:
@@ -1290,7 +1364,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
-        sensitive_err = _check_sensitive_path(_p, task_id)
+        sensitive_err = _check_sensitive_path_for_tier(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
         if not cross_profile:

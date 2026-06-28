@@ -6864,7 +6864,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # ── Trust tier (set point 1) ──────────────────────────────────
+        # The sender passed authorization above; resolve their trust tier
+        # once (BR-1) and bind it to the context for the rest of this turn.
+        # Internal events skip the auth gate and are fixed to OWNER
+        # (system-generated). This binding covers the async slash-command
+        # gate (_check_slash_access) and is snapshotted by copy_context()
+        # when _run_agent dispatches to the executor; the executor closure
+        # (set point 2) re-binds it on the worker thread for the
+        # per-tool-call gates. The try/finally guarantees the tier never
+        # leaks to the next turn on this task, across every early return in
+        # the (large) dispatch body.
+        from gateway.trust import (
+            TrustTier as _TrustTier,
+            reset_current_trust_tier as _reset_trust_tier,
+            set_current_trust_tier as _set_trust_tier,
+        )
+        if is_internal:
+            _trust_tier = _TrustTier.OWNER
+        else:
+            _trust_tier = self._resolve_trust_tier(source)
+        _trust_tier_token = _set_trust_tier(_trust_tier)
+        try:
+            return await self._dispatch_authorized_message(event, source)
+        finally:
+            _reset_trust_tier(_trust_tier_token)
+
+    async def _dispatch_authorized_message(
+        self, event: MessageEvent, source: SessionSource
+    ) -> Optional[str]:
+        """Handle a message whose sender already passed authorization.
+
+        Split out of ``_handle_message`` so the trust-tier contextvar bound
+        at intake (set point 1) can be reset in a single try/finally there,
+        regardless of which of this body's many early returns fires. Behavior
+        is otherwise identical — the body below was lifted verbatim.
+        """
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -9736,6 +9772,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
+
+        # (D) Three-tier owner-only slash gate, checked BEFORE the admin/user
+        # allow check below. Slash gating (allow_admin_from) and ownership
+        # (owner_from) are independent, coexisting keys (BR-3). The (D)
+        # sensitive action is: an admin-registered caller who is NOT the
+        # owner may not run admin slash commands — those are reserved for the
+        # owner. We judge ownership directly from the configured owner IDs
+        # (the source of truth) rather than the intake contextvar, so the gate
+        # is consistent whether reached at runtime or called directly in
+        # tests. Backward-compat: when owner_from is UNSET for the scope
+        # (empty owner set), this branch is skipped entirely and slash access
+        # keeps its prior allow_admin_from-only behavior.
+        # user_id None (Telegram service messages, channel forwards, anonymous
+        # admin posts) can never be an owner — owner identity requires a
+        # user_id. policy.is_admin(None) already returns False on an enabled
+        # policy, but guard explicitly so a None sender is unambiguously
+        # treated as non-owner and never trips (or is exempted from) this gate.
+        owner_ids = self._owner_user_ids_for_source(source)
+        if (
+            policy.enabled
+            and owner_ids
+            and source.user_id
+            and policy.is_admin(source.user_id)
+            and source.user_id not in owner_ids
+        ):
+            logger.info(
+                "Slash command /%s denied for non-owner admin %s:%s (owner-only)",
+                canonical_cmd,
+                source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            return (
+                f"⛔ /{canonical_cmd} can only be run by the owner. "
+                "Ask the bot owner to run it."
+            )
+
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -15252,6 +15324,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
+            # Trust tier (set point 2): copy_context() already snapshotted the
+            # tier bound at intake (set point 1) into this executor thread, so
+            # get_current_trust_tier() reads the correct value here. Re-bind it
+            # explicitly so the per-tool-call gates (approval, file_tools) on
+            # this worker thread observe a stable, locally-owned value rather
+            # than racing on the inherited contextvar.
+            from gateway.trust import (
+                get_current_trust_tier as _get_trust_tier_2,
+                reset_current_trust_tier as _reset_trust_tier_2,
+                set_current_trust_tier as _set_trust_tier_2,
+            )
+            _trust_tier_token_2 = _set_trust_tier_2(_get_trust_tier_2())
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
@@ -15311,6 +15395,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+                _reset_trust_tier_2(_trust_tier_token_2)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

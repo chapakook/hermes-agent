@@ -150,6 +150,85 @@ are useful. They are not boundaries.
   is operator review before install. Reviewing a skill means
   reading its Python code and scripts, not just its SKILL.md
   description — skills execute arbitrary Python at import time.
+- The **three-tier caller model** (OWNER / TRUST / NO-TRUST) sorts
+  authorized senders so that *sensitive actions* are reserved for the
+  owner. It is described in full below. Like the approval gate, it is
+  an in-process heuristic, not a boundary.
+
+#### Three-tier caller model
+
+Of the callers an adapter admits (§2.6), Hermes Agent distinguishes
+three tiers and reserves *sensitive actions* for the owner. The tier
+is resolved once when a message arrives and reused for that turn.
+
+| Tier | Who | Sensitive actions |
+|------|-----|-------------------|
+| **OWNER** | A sender listed by `user_id` in the platform's `owner_from` (DMs) / `group_owner_from` (groups) config key. Home Assistant and webhook events are always OWNER (system-authenticated). | Allowed — still subject to the normal approval gate. |
+| **TRUST** | A sender that passed the access allowlist (§2.6) but is **not** an owner. Normal conversation and non-sensitive tools are unaffected. | Refused immediately, with no owner-approval wait. |
+| **NO-TRUST** | A sender that did not pass the allowlist. Behavior is unchanged: DMs get a pairing code, groups are silently ignored. | N/A — never reaches the agent. |
+
+**Sensitive actions** (owner-only; refused for TRUST):
+
+1. Dangerous shell commands — anything matching the approval gate's
+   `DANGEROUS_PATTERNS`.
+2. Secret / credential reads — e.g. `cat`/`head`/`less` of `*.env`,
+   `*.pem`, `*.key`, `~/.ssh/*`, `~/.netrc`, `~/.hermes/.env`.
+3. Sensitive-file writes — writing `config.yaml`, `.env`, system
+   config under `/etc`, `~/.ssh`, and similar via the file tools.
+   For TRUST these are blocked entirely. For OWNER there is a single
+   carve-out in the other direction: the owner is allowed to write
+   other sensitive paths (e.g. `~/.ssh`, `/etc`) — still subject to
+   the normal approval gate — but is **never** allowed to write
+   `~/.hermes/config.yaml`. That file holds `approvals.mode` / yolo,
+   so letting the agent write it (even as owner) would let it disable
+   its own approval gate mid-session. The config.yaml block is
+   symlink-resolved and fails closed if the config path can't be
+   determined.
+4. Owner-only slash commands — the same commands gated by
+   `allow_admin_from`, denied for TRUST callers with an owner-only
+   message.
+
+**Configuring the owner.** Set `owner_from` (and `group_owner_from`
+for group scope) on the platform, listing the `user_id`s that are
+owners. This is a **separate key from `allow_admin_from`**: the
+former designates the sensitive-action owner, the latter designates
+slash-command admins. Both may be set independently and coexist.
+
+> **`owner_from` is config-only.** Unlike the access allowlists, it
+> has **no environment-variable bridge** — there is no
+> `*_OWNER_FROM` env var. Owner identity must be set in
+> `config.yaml` (under the platform block). Setting an env var will
+> not designate an owner.
+
+When `owner_from` is **not set**, the platform has no OWNER. In that
+case every authorized sender is TRUST, so *all* sensitive actions are
+refused (except system-internal / Home Assistant / webhook events).
+This is a deliberate fail-closed default (no owner ⇒ no one may run
+sensitive actions), and it is a **behavior change** for existing
+installs that relied on every authorized caller being able to run
+dangerous commands — list yourself in `owner_from` to restore that.
+
+#### Limitations and bypassability
+
+The three-tier model is an in-process heuristic running inside the
+single agent process. It is **not a security boundary** and does not
+sandbox a TRUST caller:
+
+- The sensitive-action gates are pattern- and call-site-based. A
+  prompt-injected or adversarial agent can read secrets or run
+  dangerous logic through paths the patterns do not cover —
+  `python -c`, `xxd`, `env | grep`, base64-encoded payloads, and
+  any other Turing-complete shell construction. Secret-read
+  detection in particular only catches the obvious plaintext-dump
+  tools.
+- All tiers share one process, one set of credentials, and one tool
+  surface. The tier value lives in a context variable, not an OS
+  privilege boundary.
+
+For real per-caller isolation, run **separate agent instances with
+separate allowlists**, or wrap the agent in OS-level access control
+(§2.2). The three-tier model only prevents a *cooperative* TRUST
+caller from stumbling into owner-only actions.
 
 ### 2.5 Plugin Trust Model
 
@@ -207,9 +286,12 @@ authorization model, but the rules below apply uniformly.
    boundaries.** Knowing another caller's session ID does not grant
    access to their approvals or output; authorization is always
    re-checked against the allowlist (or OS-level equivalent).
-4. **Within the authorized set, all callers are equally trusted.**
-   Hermes Agent does not model per-caller capabilities inside a
-   single adapter. Operators who need capability separation should
+4. **Within the authorized set, the three-tier caller model
+   (§2.4) is an in-process heuristic, not a capability boundary.**
+   Hermes Agent sorts authorized callers into OWNER / TRUST /
+   NO-TRUST and reserves sensitive actions for the owner, but this
+   is a cooperative-mistake guardrail — it does not sandbox a
+   caller. Operators who need real capability separation should
    run separate agent instances with separate allowlists.
 5. **Binding a local-only surface to a non-loopback interface is a
    break-glass operator decision (§3.2).** The dashboard and other
